@@ -1,0 +1,14 @@
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: HelloWorldPipeline
+      model_stage: diffusion
+      parallel_config:
+        tensor_parallel_size: 4

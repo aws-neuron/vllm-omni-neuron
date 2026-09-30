@@ -1,0 +1,7 @@
+vllm-omni==0.24.0
+vllm-neuron
+libtorch-neuronx-lite==2.11.0.1.0.*
+neuronx-cc==2.27.5334.0
+islpy==2026.1
+setuptools-scm>=8
+psutil
