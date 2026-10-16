@@ -58,9 +58,11 @@ NeuronCores, `ring_degree` shards the packed sequence (context parallelism):
 `tensor_parallel_size=8` x `ring_degree=8` uses all 64 cores of a `trn2.48xlarge`, as in
 [`minimax_h3_stage.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/main/examples/minimax_h3/minimax_h3_stage.yaml).
 
-Context-parallel attention all-gathers keys and values and runs flash attention locally; it does
-not use the const-max ring-attention kernel, whose softmax bound is too loose for MiniMax-H3's
-QK-norm scales (see `vllm_omni_neuron/diffusion/models/minimax_h3/attention.py`).
+Context-parallel attention picks a kernel per block from its QK-norm gains. 47 of the 50 blocks
+bound their scores within 255 nats and run the const-max ring-attention kernel (K/V stay local);
+blocks 45, 48 and 49 exceed that bound by far and all-gather keys and values for flash attention.
+Both paths mask the padding exactly (see `vllm_omni_neuron/diffusion/models/minimax_h3/attention.py`);
+`MINIMAX_H3_RING_ATTENTION=0` keeps every block on the all-gather path.
 
 ## Usage
 

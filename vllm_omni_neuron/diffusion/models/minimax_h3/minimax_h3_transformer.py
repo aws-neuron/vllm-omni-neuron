@@ -37,6 +37,8 @@ timestep MLP and the two output heads stay float32 while the block stack (includ
 projections) runs bfloat16.
 """
 
+import logging
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -53,13 +55,22 @@ from vllm_neuron.utils.weight_loader import (
 
 from vllm_omni_neuron.diffusion.distributed.parallel_state import (
     get_cp_group,
+    get_cp_replica_groups,
     register_replica_groups,
 )
 from vllm_omni_neuron.diffusion.models.minimax_h3 import parallel
 from vllm_omni_neuron.diffusion.models.minimax_h3.attention import (
+    can_run_ring_attention,
     context_parallel_attention,
     local_attention,
+    ring_attention,
+    ring_bound_holds,
 )
+
+logger = logging.getLogger(__name__)
+
+#: ``0`` keeps every block on the gathered-K/V path (an A/B switch for the ring kernel).
+_RING_ATTENTION_ENV = "MINIMAX_H3_RING_ATTENTION"
 
 # MiniMax-H3 tags every row of the packed sequence with the modality it belongs to and
 # keeps one set of AdaLN modulation parameters per (timestep, modality) pair:
@@ -374,7 +385,8 @@ class MiniMaxH3Attention(nn.Module):
     Sharded over heads, so ``num_attention_heads`` (56) must be divisible by the TP world size.
     The per-head query/key norms normalize ``attention_head_dim``, which is never split, so they
     stay local. Under context parallelism the rank holds one shard of the rows and attends to the
-    whole sequence over all-gathered keys and values; see `attention.context_parallel_attention`.
+    whole sequence: over a K/V ring when the block's QK-norm gains bound its scores (``use_ring``,
+    set after loading), else over all-gathered keys and values; see `attention`.
     """
 
     def __init__(
@@ -421,6 +433,7 @@ class MiniMaxH3Attention(nn.Module):
         set_weight_loader(self.o_proj_weight, _row_weight_loader(tp_inner_dim, tp_size))
 
         self.scale = 1.0 / (attention_head_dim**0.5)
+        self.use_ring = False
 
     def forward(
         self,
@@ -445,7 +458,12 @@ class MiniMaxH3Attention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        if context.cp_group is not None and self.sequence_is_sharded:
+        if context.cp_group is not None and self.sequence_is_sharded and self.use_ring and can_run_ring_attention(query):
+            attn_output = ring_attention(
+                query, key, value, self.scale, context.ring_groups, context.cp_size,
+                context.key_start, context.key_end, context.shard_start,
+            )
+        elif context.cp_group is not None and self.sequence_is_sharded:
             attn_output = context_parallel_attention(
                 query, key, value, self.scale, context.cp_group, context.key_start, context.key_end
             )
@@ -468,11 +486,17 @@ class _AttentionContext:
         key_start: ``(1,)`` int32 first row that acts as a key (the end of the prompt padding).
         key_end: One past the last row that acts as a key.
         cp_group: The CP group when the rows are sharded over it, else None.
+        ring_groups: Every CP ring's global ranks, for the ring kernel.
+        cp_size: The CP world size.
+        shard_start: First padded-sequence row of this rank's shard.
     """
 
     key_start: torch.Tensor
     key_end: int
     cp_group: object = None
+    ring_groups: tuple = ()
+    cp_size: int = 1
+    shard_start: int = 0
 
 
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
@@ -734,6 +758,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         register_replica_groups(tp_size=parallel.tp_size(), cp_size=self.cp_size)
         # Resolved here rather than in `forward`: a Python-side lookup Dynamo cannot trace.
         self.cp_group = get_cp_group() if self.cp_size > 1 else None
+        self.cp_ring_groups = get_cp_replica_groups(parallel.tp_size(), self.cp_size) if self.cp_size > 1 else ()
         # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
         self._stage_compiler = None
 
@@ -966,7 +991,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             min(shard.end, row_runs.sequence_length),
             pad_to=shard.shard_length,
         )
-        return runs, _AttentionContext(key_start, row_runs.sequence_length, cp_group=self.cp_group)
+        return runs, _AttentionContext(
+            key_start,
+            row_runs.sequence_length,
+            cp_group=self.cp_group,
+            ring_groups=self.cp_ring_groups,
+            cp_size=self.cp_size,
+            shard_start=shard.start,
+        )
 
     def _prologue(
         self,
@@ -1177,6 +1209,13 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 state_dict[name] = tensor.to(target_dtype)
 
         self.load_state_dict(state_dict, strict=False, assign=True)
+
+        ring = os.environ.get(_RING_ATTENTION_ENV, "1") != "0"
+        for block in self.transformer_blocks:
+            block.attn.use_ring = ring and ring_bound_holds(block.attn.norm_q.weight, block.attn.norm_k.weight)
+        gathered = [index for index, block in enumerate(self.transformer_blocks) if not block.attn.use_ring]
+        if self.cp_size > 1:
+            logger.info("MiniMax-H3 blocks %s attend over gathered K/V; the rest over the K/V ring.", gathered)
 
 
 class WholeGraph(nn.Module):

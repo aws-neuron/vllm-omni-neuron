@@ -8,17 +8,19 @@ per-query KV bounds (``bound_min`` / ``bound_max``) exclude them exactly, so the
 their aligned length; ``key_start`` is a runtime tensor, so one graph serves every prompt length in
 a bucket.
 
-Context parallelism keeps each rank's query rows local and all-gathers keys and values, so every
-rank attends its shard of queries to the whole sequence with the online-softmax ``attention_cte``
-kernel. Keys and values travel in one collective rather than two: on Trn2 a collective's cost is
-dominated by a fixed per-call overhead, not by its bytes.
+Context parallelism runs one of two cores, chosen per block from its QK-norm gains:
 
-The plugin's const-max ring kernel is deliberately not used. It replaces the running softmax max
-with the per-row bound ``scale * |q| * max|k|``, which its own docstring notes silently zeroes rows
-once the bound exceeds the true max by ~85 nats. H3's learned QK-norm scales put the bound far
-past that in its late blocks (the last block's ``norm_q`` reaches 33.75, a bound of ~300 nats);
-measured at 704x384, ring CP=4 lands 39% (relative L2) away from an fp32 reference against 7% for
-this path, which is within the 9% a bf16 run of the reference itself shows.
+* the plugin's const-max ring kernel, for blocks whose scores are bounded by
+  ``sqrt(head_dim) * max|g_q| * max|g_k| <= RING_MAX_SCORE_NATS``. K/V stay local and rotate
+  over a ``collective_permute`` ring; the kernel replaces the running softmax max with the
+  per-row bound ``scale * |q| * max|k|``, which silently zeroes rows once it overshoots the true
+  max by ~85 nats. 47 of H3's 50 blocks are bounded by <=96 nats. The kernel takes no mask, so
+  non-key rows enter with zero K and V — each adds exactly ``1`` to the softmax sum and nothing to
+  its numerator — and the output is rescaled exactly from the kernel's LSE.
+* K/V all-gathered once per block and the online-softmax ``attention_cte`` kernel, for the rest
+  (blocks 45, 48, 49: the last block's ``norm_q`` reaches 33.75, a bound past 1100 nats). Keys
+  and values travel in one collective: on Trn2 a collective's cost is dominated by a fixed
+  per-call overhead, not by its bytes.
 """
 
 from __future__ import annotations
@@ -38,6 +40,20 @@ from vllm_omni_neuron.lite_compat import nki_op
 _ATTN_MAX_BS = 512
 _ATTN_MAX_SEQLEN = 131072
 _ATTN_MAX_HEAD_DIM = 128
+
+#: Largest score bound (nats) a block may have to run the const-max ring kernel.
+RING_MAX_SCORE_NATS = 255.0
+
+
+def ring_bound_holds(norm_q_weight: torch.Tensor, norm_k_weight: torch.Tensor) -> bool:
+    """Whether a block's QK-norm gains bound its scores within `RING_MAX_SCORE_NATS`.
+
+    After the RMS norm ``|q| <= sqrt(d) * max|g_q|`` (likewise ``k``), so the scaled score is at
+    most ``sqrt(d) * max|g_q| * max|g_k|``.
+    """
+    g_q = norm_q_weight.detach().to("cpu", torch.float32).abs().max()
+    g_k = norm_k_weight.detach().to("cpu", torch.float32).abs().max()
+    return float(norm_q_weight.shape[-1] ** 0.5 * g_q * g_k) <= RING_MAX_SCORE_NATS
 
 
 @nki.jit
@@ -90,6 +106,11 @@ def _can_use_attention_kernel(query: torch.Tensor, key: torch.Tensor) -> bool:
     )
 
 
+def can_run_ring_attention(query: torch.Tensor) -> bool:
+    """The ring kernel takes head_dim 128; the shards are `SHARD_ALIGN`-aligned for its LSE tiles."""
+    return can_run_kernel(query) and query.shape[-1] == 128 and query.shape[1] % 128 == 0
+
+
 def _torch_attend(query, key, value, scale, key_start=None, key_end=None):
     """``softmax(scale Q K^T) V`` over the keys ``[key_start, key_end)``; token-major ``[B, S, N, D]``."""
     q, k, v = (t.transpose(1, 2).float() for t in (query, key, value))
@@ -135,3 +156,42 @@ def context_parallel_attention(query, key, value, scale, cp_group, key_start: to
     """
     key_value = cp_group.all_gather(torch.stack((key, value)).contiguous(), dim=2)
     return local_attention(query, key_value[0], key_value[1], scale, key_start, key_end)
+
+
+def _ring_kernel(query, key, value, scale, replica_groups, num_workers):
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    from vllm_omni_neuron.kernels.nkilib.experimental.attention.ring_attention_const_max_fwd import (
+        ring_attention_const_max_fwd,
+    )
+
+    return wrap_nki(ring_attention_const_max_fwd)[_kernel_lnc()](
+        q=query,
+        k=key,
+        v=value,
+        replica_groups=replica_groups,
+        num_workers=num_workers,
+        softmax_scale=scale,
+        training=True,  # the LSE drives the padding correction
+    )
+
+
+def ring_attention(
+    query, key, value, scale, replica_groups, num_workers: int, key_start: torch.Tensor, key_end: int, shard_start: int
+):
+    """`context_parallel_attention` with K/V kept local and rotated over the CP ring.
+
+    Token-major ``[B, local_S, N, D]`` in and out; this shard's rows start at ``shard_start``
+    of the padded sequence. Rows outside ``[key_start, key_end)`` enter with zero K and V, so each
+    adds ``exp(0) = 1`` to the softmax sum and nothing to its numerator; with ``LSE`` the log of
+    the full sum, the output over the real keys is ``o / (1 - num_pad * exp(-LSE))``.
+    """
+    B, S, N, D = query.shape
+    index = torch.arange(S, device=key.device, dtype=torch.int32) + shard_start
+    keep = ((index >= key_start) & (index < key_end)).to(key.dtype).view(1, S, 1, 1)
+    out, lse = _ring_kernel(query, key * keep, value * keep, scale, replica_groups, num_workers)
+    # LSE comes tiled as (B, N, 128, S / 128): token g * 128 + p sits at [..., p, g].
+    lse = lse.transpose(2, 3).reshape(B, N, -1)[..., :S].float()
+    num_pad = (num_workers * S - key_end) + key_start.float()
+    out = out.float() / (1.0 - num_pad * torch.exp(-lse)).unsqueeze(-1)
+    return out.to(query.dtype).transpose(1, 2)
