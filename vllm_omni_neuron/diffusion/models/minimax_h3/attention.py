@@ -16,7 +16,8 @@ Context parallelism runs one of two cores, chosen per block from its QK-norm gai
   per-row bound ``scale * |q| * max|k|``, which silently zeroes rows once it overshoots the true
   max by ~85 nats. 47 of H3's 50 blocks are bounded by <=96 nats. The kernel takes no mask, so
   non-key rows enter with zero K and V — each adds exactly ``1`` to the softmax sum and nothing to
-  its numerator — and the output is rescaled exactly from the kernel's LSE.
+  its numerator — and the output is rescaled exactly from the kernel's LSE. Only inside the
+  whole-model graph: launched as its own per-block graph, a ring block is slower than gathering.
 * K/V all-gathered once per block and the online-softmax ``attention_cte`` kernel, for the rest
   (blocks 45, 48, 49: the last block's ``norm_q`` reaches 33.75, a bound past 1100 nats). Keys
   and values travel in one collective: on Trn2 a collective's cost is dominated by a fixed

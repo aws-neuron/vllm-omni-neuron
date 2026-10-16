@@ -458,12 +458,13 @@ class MiniMaxH3Attention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        if context.cp_group is not None and self.sequence_is_sharded and self.use_ring and can_run_ring_attention(query):
+        sharded = context.cp_group is not None and self.sequence_is_sharded
+        if sharded and self.use_ring and context.ring_groups and can_run_ring_attention(query):
             attn_output = ring_attention(
                 query, key, value, self.scale, context.ring_groups, context.cp_size,
                 context.key_start, context.key_end, context.shard_start,
             )
-        elif context.cp_group is not None and self.sequence_is_sharded:
+        elif sharded:
             attn_output = context_parallel_attention(
                 query, key, value, self.scale, context.cp_group, context.key_start, context.key_end
             )
@@ -486,7 +487,8 @@ class _AttentionContext:
         key_start: ``(1,)`` int32 first row that acts as a key (the end of the prompt padding).
         key_end: One past the last row that acts as a key.
         cp_group: The CP group when the rows are sharded over it, else None.
-        ring_groups: Every CP ring's global ranks, for the ring kernel.
+        ring_groups: Every CP ring's global ranks, for the ring kernel; None keeps every block on
+            the all-gather path.
         cp_size: The CP world size.
         shard_start: First padded-sequence row of this rank's shard.
     """
@@ -494,7 +496,7 @@ class _AttentionContext:
     key_start: torch.Tensor
     key_end: int
     cp_group: object = None
-    ring_groups: tuple = ()
+    ring_groups: tuple | None = None
     cp_size: int = 1
     shard_start: int = 0
 
@@ -967,7 +969,10 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         )
         pending = [probe]
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = outputs
-        runs, context = self._block_geometry(row_runs, key_start)
+        # Per-block graphs keep every block on the all-gather path: launched as its own graph, a
+        # ring block costs ~17 ms more than an all-gather one (2.325 vs 1.526 s/step at 37888 rows),
+        # where inside the whole graph it saves 0.2 s/step.
+        runs, context = self._block_geometry(row_runs, key_start, ring=False)
         for block in stages["blocks"]:
             hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
             pending.append(probe)
@@ -978,7 +983,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             probe.to("cpu")
         return stages["epilogue"](hidden_states, temb, norm_out_run_rows, row_runs)
 
-    def _block_geometry(self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor):
+    def _block_geometry(self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor, ring: bool = True):
         """This rank's run spans and attention context: static geometry, computed in Python."""
         runs = row_runs.runs
         if self.cp_size <= 1:
@@ -995,7 +1000,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             key_start,
             row_runs.sequence_length,
             cp_group=self.cp_group,
-            ring_groups=self.cp_ring_groups,
+            ring_groups=self.cp_ring_groups if ring else None,
             cp_size=self.cp_size,
             shard_start=shard.start,
         )

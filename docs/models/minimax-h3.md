@@ -61,6 +61,8 @@ NeuronCores, `ring_degree` shards the packed sequence (context parallelism):
 Context-parallel attention picks a kernel per block from its QK-norm gains. 47 of the 50 blocks
 bound their scores within 255 nats and run the const-max ring-attention kernel (K/V stay local);
 blocks 45, 48 and 49 exceed that bound by far and all-gather keys and values for flash attention.
+The ring applies only to the whole-model graph: in per-block graphs (sequences of 48K rows or more,
+e.g. `ref2va`) a ring block launched alone is slower than an all-gather one, so every block gathers.
 Both paths mask the padding exactly (see `vllm_omni_neuron/diffusion/models/minimax_h3/attention.py`);
 `MINIMAX_H3_RING_ATTENTION=0` keeps every block on the all-gather path.
 
@@ -113,9 +115,11 @@ the same diffusers model run on NeuronCores is shown for comparison.
 |---|---|---|---|---|
 | 704x384 | 8 cores (TP=8) | 7.8% | 0.9970 | 3.3% |
 | 704x384 | 32 cores (TP=8 x CP=4) | 7.3% | 0.9974 | 2.8% |
-| 704x384 | 64 cores (TP=8 x CP=8) | 6.4% | 0.9980 | 3.3% |
+| 704x384 | 64 cores (TP=8 x CP=8), ring | 8.7% | 0.9962 | 2.9% |
+| 704x384 | 64 cores (TP=8 x CP=8), all-gather | 6.7% | 0.9978 | 3.5% |
 | 704x384 | Diffusers on CPU, BF16 (floor) | 9.1% | 0.9959 | 3.2% |
-| 1344x768 | 64 cores (TP=8 x CP=8) | 5.5% | 0.9986 | 7.4% |
+| 1344x768 | 64 cores (TP=8 x CP=8), ring | 6.0% | 0.9983 | 4.8% |
+| 1344x768 | 64 cores (TP=8 x CP=8), all-gather | 5.5% | 0.9986 | 5.3% |
 | 1344x768 | Diffusers on 64 NeuronCores, BF16 | 23.2% | 0.9730 | 11.0% |
 
 `fl2va` (first and last keyframe) and `ref2va` (an image, a 1-second video with its soundtrack and a
@@ -150,7 +154,7 @@ loading), measured end to end at the Omni entrypoint.
 
 | NeuronCores | Configuration | DiT s/step | Text encoder | DiT (49 steps) | Video decoder | Audio decoder | Request |
 |---|---|---|---|---|---|---|---|
-| 64 | TP=8 x CP=8 | 1.434 | 0.18 s | 72.4 s | 2.9 s | 1.0 s | **78.1 s** |
+| 64 | TP=8 x CP=8 | 1.220 | 0.19 s | 61.9 s | 2.9 s | 1.0 s | **67.9 s** |
 | 32 | TP=8 x CP=4 | 2.547 | 5.0 s | 126.8 s | 15.8 s | 1.2 s | **151.1 s** |
 | 16 | TP=8 x CP=2 | 5.013 | 2.8 s | 257.9 s | 16.1 s | 1.2 s | **280.4 s** |
 | 8 | TP=8 | 12.694 | 4.4 s | 623.5 s | 19.2 s | 1.3 s | **650.5 s** |
@@ -159,13 +163,15 @@ loading), measured end to end at the Omni entrypoint.
 The 64-core row runs the conditioner on NeuronCores (the default there; with it on the host the
 request took 98.6 s, the host encoder taking 0.9–6 s for the same prompt) and gathers the decoded
 tiles through shared memory (13.0 s of video decoding before, 6.0 s of it pickling ~1 GB of
-tiles through the CPU group). The 8–32-core rows predate the shared-memory gather; below 64 cores
-the conditioner is on the host.
+tiles through the CPU group) and runs 47 of the 50 blocks on the ring kernel (1.425 s/step and
+78.1 s with every block gathering). The 8–32-core rows predate both the shared-memory gather and
+the ring kernel; below 64 cores the conditioner is on the host.
 
 `ref2va` at 1344x768 on 64 cores — an image, a 1-second video with its soundtrack and a 2-second
-audio clip (an 8243-token presentation, 60928 DiT rows) — takes **222.7 s** per request: 47.9 s to
-encode the references (most of it the video VAE encoder), 158.9 s of DiT (3.19 s/step, per-block
-graphs) and 13.0 s of decoding. With the whole conditioner on the host it took 339.9 s. Peak HBM
+audio clip (an 8243-token presentation, 60928 DiT rows) — takes **205.5 s** per request: 40.8 s to
+encode the references (most of it the video VAE encoder), 158.8 s of DiT (3.18 s/step, per-block
+graphs, every block gathering: with the ring kernel these graphs ran 6.09 s/step) and 4.0 s of
+decoding. With the whole conditioner on the host it took 339.9 s. Peak HBM
 for this request is 22.1 GiB per core of 24 (19.6 without the conditioner on NeuronCores).
 
 The conditioner on NeuronCores matches it on the host to 1.5e-3 (relative L2) for a text prompt.
