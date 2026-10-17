@@ -1,0 +1,12 @@
+pytest>=8.0
+pytest-cov>=5.0
+pytest-timeout>=2.2
+pytest-split>=0.9
+pytest-xdist>=3.5
+matplotlib
+torchmetrics[image]>=1.0
+torchvision>=0.17
+# Required by the diffusers WanImageToVideoPipeline reference used in the I2V
+# accuracy test (test/neuron/test_wan_i2v_pipeline_accuracy.py): diffusers cleans
+# prompts via ftfy.fix_text, so importing the reference pipeline needs ftfy.
+ftfy>=6.3.1

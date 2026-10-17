@@ -1,0 +1,17 @@
+stages:
+  - stage_id: 0
+    max_num_seqs: 2
+    runtime:
+      devices: "0-31"
+    engine_args:
+      model_class_name: Wan22I2VPipeline
+      dtype: bfloat16
+      boundary_ratio: 0.9
+      flow_shift: 5.0
+      vae_use_tiling: true
+      model_config:
+        tp_sequence_parallel: true
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 4
+        vae_patch_parallel_size: 32

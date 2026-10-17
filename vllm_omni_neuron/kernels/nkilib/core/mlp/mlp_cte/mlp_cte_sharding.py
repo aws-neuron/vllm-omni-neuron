@@ -1,0 +1,191 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MLP CTE sharding strategies for distributing computation across multiple cores."""
+
+from dataclasses import dataclass
+from enum import Enum, auto
+
+import nki.language as nl
+from nki.language import NKIObject
+
+from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import get_program_sharding_info
+from ..mlp_parameters import (
+    MLPParameters,
+    mlpp_has_projection_bias,
+    override_inter_size,
+)
+
+_MAX_SHARD_ON_I_BXS = 256
+_MAX_SHARD_ON_S_BXS_BASIC = 2048
+_MAX_SHARD_ON_S_BXS_MX = 4096
+_2X_BASIC_I_TILE_SIZE = 256
+_2X_MX_I_TILE_SIZE = 1024
+
+
+# Calculate the type of sharding we should do given the MLP parameters
+# NOTE: Sharding on just batch * sequence length is supported through the code but is never activated.
+#       But we leave the infrastructure in place in case we need it in the future.
+# Returns a tuple (sharded_dim, shards) instead of ShardInfo to work around compiler tracing limitations
+# @throws AssertionError: If no valid tile size can be found that divides the bxs evenly, or
+#                         if the bxs is not divisible by a power of 2 >= 256
+def calculate_sharding(mlp_params: MLPParameters):
+    """Calculate optimal sharding strategy for MLP computation.
+
+    Determines whether to shard on intermediate dimension or batch×sequence dimension
+    based on tensor sizes and hardware constraints.
+
+    Args:
+        mlp_params: MLP configuration parameters
+
+    Returns:
+        ShardInfo object containing sharding configuration
+
+    Intended Usage:
+        Called once per program to determine sharding strategy for the computation
+    """
+    _, num_shard_workers, program_id = get_program_sharding_info()
+    # In order to shard on the intermediate dimension, there must be 2 total workers and the batch * sequence must be
+    # less than or equal to 256.  We pick this because that means each core will have a batch sequence of 128 or less
+    # to process.  This is right at the threshold of the size of the partition dimension.  These small numbers cause
+    # inefficient use of compute because of that.
+    # The MX kernel applies the projection bias per I-shard, so it can shard on I with a bias active.  The basic
+    # kernel does not support any projection bias (up/down/gate) when sharding on I, so just don't shard on I if
+    # any of those are active.
+    bxs = mlp_params.batch_size * mlp_params.sequence_len
+    supports_bias_on_inter = mlp_params.quant_params.is_dtype_mx() or not mlpp_has_projection_bias(mlp_params)
+    shard_on_inter = (num_shard_workers == 2) and (bxs <= _MAX_SHARD_ON_I_BXS) and supports_bias_on_inter
+    if mlp_params.quant_params.is_dtype_mx():
+        shard_on_inter = shard_on_inter or (
+            mlp_params.intermediate_size > _MAX_SHARD_ON_S_BXS_MX
+            and mlp_params.intermediate_size % _2X_MX_I_TILE_SIZE == 0
+        )
+    else:
+        shard_on_inter = shard_on_inter or (
+            mlp_params.intermediate_size > _MAX_SHARD_ON_S_BXS_BASIC
+            and mlp_params.intermediate_size % _2X_BASIC_I_TILE_SIZE == 0
+        )
+    # Put some heuristics on shard on I that are conservative. There are clearly cases where the performance of sharding
+    # on S is better for small sizes of S.  Those cases are where both I and H are small.
+    if mlp_params.hidden_size < 7168 or mlp_params.intermediate_size < 1024:
+        shard_on_inter = False
+
+    if shard_on_inter:
+        sharded_dim = ShardedDim.INTERMEDIATE
+        shards = _calculate_intermediate_sharding(mlp_params, program_id, num_shard_workers)
+    else:
+        sharded_dim = ShardedDim.BATCH_X_SEQUENCE_LENGTH
+        shards = _calculate_bxs_sharding(mlp_params, program_id, num_shard_workers)
+
+    return ShardInfo(sharded_dim, shards)
+
+
+#
+# Program helpers
+
+
+class ShardedDim(Enum):
+    NONE = auto()
+    SEQUENCE_LENGTH = auto()
+    INTERMEDIATE = auto()
+    BATCH_X_SEQUENCE_LENGTH = auto()
+
+
+def is_sharded_dim_bxs_or_s(sharded_dim: ShardedDim) -> bool:
+    """Check if sharded dimension is batch×sequence or sequence length."""
+    return sharded_dim == ShardedDim.SEQUENCE_LENGTH or sharded_dim == ShardedDim.BATCH_X_SEQUENCE_LENGTH
+
+
+def is_sharded_dim_bxs(sharded_dim: ShardedDim) -> bool:
+    """Check if sharded dimension is batch×sequence length."""
+    return sharded_dim == ShardedDim.BATCH_X_SEQUENCE_LENGTH
+
+
+"""
+    An instance of DimShard represents a shard on a specific dimension.  The members specific the shard region
+    along with the associated kernels parameters.  shard_mlp_params is typically provided in this structure
+    such that the sharded dimension size is specified as the size of the shard.  We do this with shard_mlp_params
+    so that the most of the rest of the code can be written in a way that is agnostic to shard size, original tensor
+    size, and whether or not sharding is even used.
+
+    For example, assume we are sharding on the S dimension, the S dimension size is 1024, and our shard size is 512.
+    Two instances of DimShard would represent this.  Instance #1 would have a dim_offset of 0, a dim_size of 512,
+    and the S dimension size in shard_mlp_params would be set to 512.  Instance #2 would have a dim_offset of 512 (i.e.
+    offset into the tensor by 512), a dim_size of 512, and the S dimension size in shard_mlp_params would be set to 512.
+"""
+
+
+@dataclass
+class DimShard(NKIObject):
+    dim_offset: int  # Offset into the dimension being sharded on
+    dim_size: int  # The size of the shard
+    shard_mlp_params: MLPParameters  # Kernel params with an updated sharded dimension based on the shard size
+
+
+@dataclass
+class ShardInfo(NKIObject):
+    sharded_dim: ShardedDim  # The dimension being sharded
+    shards: list  # The shards that the worker will process - list[DimShard]
+
+
+#
+# Based on the kernel parameters and the current SPMD program, build and return a list of shards
+# on the intermediate dimension that the kernel needs to process.
+def _calculate_intermediate_sharding(
+    mlp_params: MLPParameters,
+    program_id: int,
+    num_shard_workers: int,
+) -> list[DimShard]:
+    """Calculate sharding configuration for intermediate dimension."""
+    inter_shard_size = mlp_params.intermediate_size // num_shard_workers
+    inter_offset = program_id * inter_shard_size
+    shard_mlp_params = override_inter_size(mlp_params, inter_shard_size)
+
+    return [
+        DimShard(
+            dim_offset=inter_offset,
+            dim_size=inter_shard_size,
+            shard_mlp_params=shard_mlp_params,
+        )
+    ]
+
+
+#
+# Based on the kernel parameters and the current SPMD program, build and return a list of shards
+# on the combined sequence length and batch dimensions that the kernel needs to process.
+def _calculate_bxs_sharding(
+    mlp_params: MLPParameters,
+    program_id: int,
+    num_shard_workers: int,
+) -> list[DimShard]:
+    """Calculate sharding configuration for batch×sequence dimension."""
+    # Get the tile size based on the sequence length but then we have to multiply by the batch size because
+    # we are sharding across batch size * sequence length (bxs)
+    bxs = mlp_params.batch_size * mlp_params.sequence_len
+    kernel_assert(
+        bxs % num_shard_workers == 0,
+        f"Batch times sequence length {bxs} must be a multiple of the number of shards {num_shard_workers}",
+    )
+
+    bxs_shard_size = bxs // num_shard_workers
+    return [DimShard(bxs_shard_size * program_id, bxs_shard_size, mlp_params)]
+
+
+def is_launch_grid_valid_for_mlp() -> bool:
+    """Check if launch grid configuration is valid for MLP operations."""
+    grid_ndim = nl.program_ndim()
+    if grid_ndim < 0 or grid_ndim > 1:
+        return False
+    return True

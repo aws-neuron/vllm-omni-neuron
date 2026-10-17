@@ -1,0 +1,5 @@
+vllm==0.29.0
+vllm-neuron==0.29.0.1.*
+vllm-omni==0.29.0rc1
+setuptools-scm>=8
+psutil

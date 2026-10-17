@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosmos-guardrail"
+version = "0.3.1+stub"
+description = "Empty placeholder for Neuron installations without Cosmos guardrails."
+
+[tool.setuptools]
+py-modules = []
