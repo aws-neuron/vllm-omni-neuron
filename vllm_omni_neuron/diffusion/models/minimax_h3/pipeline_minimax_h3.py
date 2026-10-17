@@ -806,6 +806,10 @@ class MiniMaxH3Pipeline(nn.Module):
             len(runs),
         )
 
+        sp_inputs = {
+            name: tensor.to(self.device)
+            for name, tensor in self.transformer.sequence_parallel_inputs(row_runs).items()
+        }
         step_times = []
         for index, (timestep, audio_timestep) in enumerate(zip(timesteps, audio_timesteps)):
             if trace_steps is not None and index >= trace_steps:
@@ -827,6 +831,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 norm_out_run_rows=norm_out_run_rows.to(self.device),
                 num_text_tokens=num_text_tokens,
                 row_runs=row_runs,
+                **sp_inputs,
             )
             noise_pred = noise_pred[0].detach().to(device="cpu", dtype=torch.float32)
             audio_noise_pred = audio_noise_pred[0].detach().to(

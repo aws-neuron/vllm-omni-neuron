@@ -42,6 +42,11 @@ def tp_rank() -> int:
     return get_tensor_model_parallel_rank()
 
 
+def tp_group():
+    """The TP `GroupCoordinator` (its collectives trace out-of-place into compiled graphs)."""
+    return get_tp_group()
+
+
 def tp_device_group():
     """The c10d group the DiT's row-parallel all-reduces run over."""
     return get_tp_group().device_group

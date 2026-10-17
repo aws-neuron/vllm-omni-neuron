@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 
 #: ``0`` keeps every block on the gathered-K/V path (an A/B switch for the ring kernel).
 _RING_ATTENTION_ENV = "MINIMAX_H3_RING_ATTENTION"
+#: ``0`` keeps the block stack's rows replicated over the TP group (an A/B switch for SP).
+_SEQUENCE_PARALLEL_ENV = "MINIMAX_H3_SEQUENCE_PARALLEL"
 
 # MiniMax-H3 tags every row of the packed sequence with the modality it belongs to and
 # keeps one set of AdaLN modulation parameters per (timestep, modality) pair:
@@ -319,6 +321,27 @@ def _rowwise(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return torch.cat([layer(piece) for piece in torch.split(x, _ROW_CHUNK, dim=1)], dim=1)
 
 
+def _tp_gather_rows(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Sequence parallelism: every TP rank's rows, in rank order (dim 1)."""
+    return parallel.tp_group().all_gather(hidden_states.contiguous(), dim=1)
+
+
+def _tp_scatter_rows(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Sequence parallelism: sum over the TP group, each rank keeping its own rows (dim 1).
+
+    The functional collective, which Lite lowers directly; the omni `GroupCoordinator` has no
+    ``reduce_scatter``.
+    """
+    import torch.distributed._functional_collectives as funcol
+
+    batch, rows, hidden = hidden_states.shape
+    flat = hidden_states.reshape(batch * rows, hidden) if batch == 1 else hidden_states.transpose(0, 1).contiguous()
+    out = funcol.reduce_scatter_tensor(flat, "sum", 0, parallel.tp_device_group())
+    if batch == 1:
+        return out.reshape(1, rows // parallel.tp_size(), hidden)
+    return out.transpose(0, 1)
+
+
 def _modulate_runs(
     hidden_states: torch.Tensor,
     shift: torch.Tensor,
@@ -370,10 +393,14 @@ class MiniMaxH3FeedForward(nn.Module):
         self.down_proj_weight = nn.Parameter(torch.empty(inner_per_rank, hidden_size))
         set_weight_loader(self.down_proj_weight, _row_weight_loader(inner_per_rank, tp_size))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, sequence_parallel: bool = False) -> torch.Tensor:
+        if sequence_parallel:
+            hidden_states = _tp_gather_rows(hidden_states)
         value = hidden_states @ self.value_proj_weight
         gate = hidden_states @ self.gate_proj_weight
         output = (value * F.silu(gate)) @ self.down_proj_weight
+        if sequence_parallel:
+            return _tp_scatter_rows(output)
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
         return output
@@ -441,6 +468,9 @@ class MiniMaxH3Attention(nn.Module):
         rotary_emb=None,
         context: "_AttentionContext | None" = None,
     ) -> torch.Tensor:
+        sequence_parallel = context.sequence_parallel and self.sequence_is_sharded
+        if sequence_parallel:
+            hidden_states = _tp_gather_rows(hidden_states)
         qkv = torch.matmul(hidden_states, self.qkv_proj_weight)
         query, key, value = torch.tensor_split(qkv, self.qkv_split, dim=-1)
 
@@ -474,6 +504,8 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         output = torch.matmul(attn_output.flatten(2), self.o_proj_weight)
+        if sequence_parallel:
+            return _tp_scatter_rows(output)
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
         return output
@@ -491,6 +523,10 @@ class _AttentionContext:
             the all-gather path.
         cp_size: The CP world size.
         shard_start: First padded-sequence row of this rank's shard.
+        sequence_parallel: The block stack's rows are further split over the TP group: each
+            attention / feed-forward all-gathers them on entry and reduce-scatters on exit.
+        tp_cols: This TP rank's slice of ``time_embed_dim`` for the row-parallel AdaLN
+            projections, as a runtime input (sequence parallelism; see `sequence_parallel_inputs`).
     """
 
     key_start: torch.Tensor
@@ -499,6 +535,8 @@ class _AttentionContext:
     ring_groups: tuple | None = None
     cp_size: int = 1
     shard_start: int = 0
+    sequence_parallel: bool = False
+    tp_cols: torch.Tensor | None = None
 
 
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
@@ -530,23 +568,36 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
         if tp_size > 1:
             set_weight_loader(self.linear_bias, _row_bias_loader(tp_size))
 
-    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(self, temb: torch.Tensor, cols: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         # The activation runs at `temb`'s own precision — float32, since `time_embedder`
         # is a float32 module in this mixed-precision checkpoint — and only its result is
         # cast down to the bfloat16 projection. Every block reads the same `temb`, so a
         # rounding applied before the activation biases every block's modulation
         # parameters identically at every sampling step, which accumulates coherently
         # over the denoising trajectory.
-        activated = F.silu(temb).to(self.linear_weight.dtype)
-        # Row-parallel: each rank holds its slice of `time_embed_dim`, so slice the
-        # replicated activation to match before the local matmul.
-        rank = parallel.tp_rank()
-        in_per_rank = self.linear_weight.shape[0]
-        activated = activated[:, rank * in_per_rank : (rank + 1) * in_per_rank]
-        temb = torch.matmul(activated, self.linear_weight) + self.linear_bias
+        # Row-parallel: each rank holds its slice of `time_embed_dim`, so the replicated
+        # activation is sliced to match before the local matmul. `cols` (a runtime input under
+        # sequence parallelism) keeps the slice out of the trace, so TP peers trace one graph.
+        temb = self.partial(temb, cols)
         if self.tp_size > 1:
             dist.all_reduce(temb, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
-        temb = temb.view(-1, 6 * self.hidden_size)
+        return self.split(temb)
+
+    def partial(self, temb: torch.Tensor, cols: torch.Tensor | None = None) -> torch.Tensor:
+        """This rank's row-parallel share of the projection, before the TP all-reduce."""
+        activated = F.silu(temb).to(self.linear_weight.dtype)
+        if cols is not None:
+            activated = activated.index_select(1, cols)
+        else:
+            rank = parallel.tp_rank()
+            in_per_rank = self.linear_weight.shape[0]
+            activated = activated[:, rank * in_per_rank : (rank + 1) * in_per_rank]
+        return torch.matmul(activated, self.linear_weight) + self.linear_bias
+
+    def split(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The all-reduced projection as the six modulation tensors."""
+        # `reshape`: a slice of the hoisted, concatenated projection is not contiguous.
+        temb = temb.reshape(-1, 6 * self.hidden_size)
         return torch.tensor_split(temb, [self.hidden_size * i for i in range(1, 6)], dim=-1)
 
 
@@ -685,27 +736,39 @@ class MiniMaxH3TransformerBlock(nn.Module):
         run_rows: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         context: _AttentionContext,
+        modulation: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        modulation = self.adaln_proj(temb)
+        if modulation is None:
+            modulation = self.adaln_proj(temb, context.tp_cols)
         # One row per run instead of one per sequence row: the six table lookups shrink
         # from `(seq_len, hidden_size)` to `(num_runs, hidden_size)`.
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
         )
 
-        residual = hidden_states
-        norm_hidden_states = _modulate_runs(
-            self.norm1(hidden_states), shift_msa, scale_msa, runs
-        )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, context)
-        hidden_states = residual + _gate_runs(attn_output, gate_msa, runs)
+        if context.sequence_parallel:
+            # `run_rows` holds one table row per local row: broadcast over the batch.
+            def modulate(hidden, shift, scale):
+                return hidden * (1.0 + scale) + shift
+
+            def gate(hidden, value):
+                return hidden * value
+        else:
+            def modulate(hidden, shift, scale):
+                return _modulate_runs(hidden, shift, scale, runs)
+
+            def gate(hidden, value):
+                return _gate_runs(hidden, value, runs)
 
         residual = hidden_states
-        norm_hidden_states = _modulate_runs(
-            self.norm2(hidden_states), shift_mlp, scale_mlp, runs
-        )
-        ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual + _gate_runs(ff_output, gate_mlp, runs)
+        norm_hidden_states = modulate(self.norm1(hidden_states), shift_msa, scale_msa)
+        attn_output = self.attn(norm_hidden_states, rotary_emb, context)
+        hidden_states = residual + gate(attn_output, gate_msa)
+
+        residual = hidden_states
+        norm_hidden_states = modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
+        ff_output = self.ff(norm_hidden_states, context.sequence_parallel)
+        hidden_states = residual + gate(ff_output, gate_mlp)
 
         return hidden_states
 
@@ -761,6 +824,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # Resolved here rather than in `forward`: a Python-side lookup Dynamo cannot trace.
         self.cp_group = get_cp_group() if self.cp_size > 1 else None
         self.cp_ring_groups = get_cp_replica_groups(parallel.tp_size(), self.cp_size) if self.cp_size > 1 else ()
+        # Sequence parallelism over the TP group: between the attention and feed-forward
+        # projections each TP rank keeps 1/tp of its CP shard (a multiple of `SHARD_ALIGN`, so
+        # it divides), and the norms, modulation and residual run on those rows only.
+        self.tp_size = parallel.tp_size()
+        self.tp_rank = parallel.tp_rank()
+        self.sequence_parallel = (
+            self.tp_size > 1 and self.cp_size > 1 and os.environ.get(_SEQUENCE_PARALLEL_ENV, "1") != "0"
+        )
         # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
         self._stage_compiler = None
 
@@ -859,6 +930,9 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         norm_out_run_rows: torch.Tensor,
         num_text_tokens: torch.Tensor,
         row_runs: MiniMaxH3RowRuns,
+        sp_rows: torch.Tensor | None = None,
+        sp_run_index: torch.Tensor | None = None,
+        tp_cols: torch.Tensor | None = None,
         return_dict: bool = False,
     ):
         """Run one denoising step over the packed sequence.
@@ -888,6 +962,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             num_text_tokens: ``(1,)`` int32 number of real prompt rows; the rest of the
                 ``num_text_rows`` bucket is the padding in front of them.
             row_runs: The static row geometry, baked into the trace.
+            sp_rows, sp_run_index: Under sequence parallelism, this TP rank's rows of its CP
+                shard and the shard-local run each reads (`sequence_parallel_inputs`).
             return_dict: Kept for signature parity with the reference; the Neuron
                 pipeline always consumes the tuple.
 
@@ -900,12 +976,14 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             return self._forward_staged(
                 hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
                 rotary_cos, rotary_sin, adaln_run_rows, norm_out_run_rows, num_text_tokens, row_runs,
+                sp_rows, sp_run_index, tp_cols,
             )
         return self._forward_whole(
             hidden_states=hidden_states, audio_hidden_states=audio_hidden_states,
             encoder_hidden_states=encoder_hidden_states, timestep=timestep, rotary_cos=rotary_cos,
             rotary_sin=rotary_sin, adaln_run_rows=adaln_run_rows, norm_out_run_rows=norm_out_run_rows,
-            num_text_tokens=num_text_tokens, row_runs=row_runs,
+            num_text_tokens=num_text_tokens, row_runs=row_runs, sp_rows=sp_rows, sp_run_index=sp_run_index,
+            tp_cols=tp_cols,
         )
 
     def _forward_whole(
@@ -920,14 +998,34 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         norm_out_run_rows,
         num_text_tokens,
         row_runs: MiniMaxH3RowRuns,
+        sp_rows=None,
+        sp_run_index=None,
+        tp_cols=None,
     ):
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = self._prologue(
             hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
-            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs,
+            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs, sp_rows, sp_run_index,
         )
-        runs, context = self._block_geometry(row_runs, key_start)
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+        runs, context = self._block_geometry(row_runs, key_start, tp_cols=tp_cols)
+        modulations = [None] * len(self.transformer_blocks)
+        if self.sequence_parallel:
+            # Every block's AdaLN projection depends on `temb` alone, so in one graph its TP
+            # all-reduce is free to interleave with the blocks' SP all-gathers and
+            # reduce-scatters — which, past a few blocks, corrupts the result (NaN with the ring
+            # kernel). Projecting all of them up front, with one all-reduce, keeps the TP
+            # collectives in program order (and saves 49 of them per step).
+            partials = [block.adaln_proj.partial(temb, context.tp_cols) for block in self.transformer_blocks]
+            reduced = torch.cat(partials, dim=-1)
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+            width = partials[0].shape[-1]
+            modulations = [
+                block.adaln_proj.split(reduced[:, index * width : (index + 1) * width])
+                for index, block in enumerate(self.transformer_blocks)
+            ]
+        for block, modulation in zip(self.transformer_blocks, modulations):
+            hidden_states = block(
+                hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context, modulation
+            )
         return self._epilogue(hidden_states, temb, norm_out_run_rows, row_runs)
 
     def compile_stages(self, compile_fn) -> None:
@@ -961,18 +1059,21 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         norm_out_run_rows,
         num_text_tokens,
         row_runs: MiniMaxH3RowRuns,
+        sp_rows=None,
+        sp_run_index=None,
+        tp_cols=None,
     ):
         stages = self._stage_compiler
         outputs, probe = stages["prologue"](
             hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
-            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs,
+            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs, sp_rows, sp_run_index,
         )
         pending = [probe]
         hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = outputs
         # Per-block graphs keep every block on the all-gather path: launched as its own graph, a
         # ring block costs ~17 ms more than an all-gather one (2.325 vs 1.526 s/step at 37888 rows),
         # where inside the whole graph it saves 0.2 s/step.
-        runs, context = self._block_geometry(row_runs, key_start, ring=False)
+        runs, context = self._block_geometry(row_runs, key_start, ring=False, tp_cols=tp_cols)
         for block in stages["blocks"]:
             hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
             pending.append(probe)
@@ -983,7 +1084,37 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             probe.to("cpu")
         return stages["epilogue"](hidden_states, temb, norm_out_run_rows, row_runs)
 
-    def _block_geometry(self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor, ring: bool = True):
+    def sequence_parallel_inputs(self, row_runs: MiniMaxH3RowRuns) -> dict[str, torch.Tensor]:
+        """Host tensors for `forward` under sequence parallelism, else ``{}``.
+
+        ``sp_rows``: this TP rank's rows of its CP shard. ``sp_run_index``: for each of them,
+        the shard-local run it belongs to (an index into the shard's AdaLN run rows).
+        ``tp_cols``: its slice of ``time_embed_dim`` (the row-parallel AdaLN input). All three
+        are runtime inputs so the TP peers trace one graph.
+        """
+        if not self.sequence_parallel:
+            return {}
+        sequence_length = row_runs.sequence_length
+        shard = parallel.sequence_shard(sequence_length, self.cp_size, self.cp_rank)
+        local_runs, _ = parallel.shard_runs(
+            row_runs.runs,
+            torch.zeros(len(row_runs.runs), dtype=torch.long),
+            shard.start,
+            min(shard.end, sequence_length),
+            pad_to=shard.shard_length,
+        )
+        run_index = torch.empty(shard.shard_length, dtype=torch.long)
+        for index, (start, end) in enumerate(local_runs):
+            run_index[start:end] = index
+        window = shard.shard_length // self.tp_size
+        rows = torch.arange(self.tp_rank * window, (self.tp_rank + 1) * window, dtype=torch.long)
+        per_rank = self.config.time_embed_dim // self.tp_size
+        cols = torch.arange(self.tp_rank * per_rank, (self.tp_rank + 1) * per_rank, dtype=torch.long)
+        return {"sp_rows": rows, "sp_run_index": run_index[rows], "tp_cols": cols}
+
+    def _block_geometry(
+        self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor, ring: bool = True, tp_cols=None
+    ):
         """This rank's run spans and attention context: static geometry, computed in Python."""
         runs = row_runs.runs
         if self.cp_size <= 1:
@@ -1003,6 +1134,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             ring_groups=self.cp_ring_groups if ring else None,
             cp_size=self.cp_size,
             shard_start=shard.start,
+            sequence_parallel=self.sequence_parallel,
+            tp_cols=tp_cols,
         )
 
     def _prologue(
@@ -1016,6 +1149,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         adaln_run_rows,
         num_text_tokens,
         row_runs: MiniMaxH3RowRuns,
+        sp_rows=None,
+        sp_run_index=None,
     ):
         """Embed the three streams, refine the prompt, pack and (under CP) shard the sequence.
 
@@ -1095,6 +1230,12 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 min(shard.end, sequence_length),
                 pad_to=shard.shard_length,
             )
+            if self.sequence_parallel:
+                # This TP rank's rows, and one AdaLN table row per row. Both are runtime inputs
+                # (see `sequence_parallel_inputs`) so the TP peers trace identical graphs: peers
+                # whose collectives the compiler schedules differently fail to rendezvous.
+                hidden_states = hidden_states.index_select(1, sp_rows)
+                adaln_run_rows = adaln_run_rows.index_select(0, sp_run_index)
 
         return hidden_states, temb, adaln_run_rows, rotary_emb[0], rotary_emb[1], key_start
 
@@ -1102,6 +1243,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         """Gather the shards (under CP), normalize the media rows and run the two output heads."""
         num_text_rows = row_runs.num_text_rows
         num_condition_rows = row_runs.num_condition_rows
+        if self.sequence_parallel:
+            hidden_states = _tp_gather_rows(hidden_states)
         if self.cp_size > 1:
             # Back to full length before the output heads, so `norm_out`'s run spans stay in
             # absolute coordinates.
