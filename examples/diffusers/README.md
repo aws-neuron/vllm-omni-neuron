@@ -1,4 +1,4 @@
-# FLUX.2 Klein Diffusers adapter proof of concept
+# Diffusers adapter example on Neuron
 
 This is an experimental **single-device, BF16, text-to-image** path for
 `black-forest-labs/FLUX.2-klein-4B`. It delegates the complete denoising loop to
@@ -47,7 +47,7 @@ NEURON_RT_VISIBLE_CORES=0 python ~/diffusers/examples/inference/flux2_klein_neur
 ## Offline serving through Omni
 
 ```bash
-python examples/flux2_klein/run.py --height 256 --width 256 --runs 2
+python examples/diffusers/run.py --height 256 --width 256 --runs 2
 ```
 
 Startup warmup and the first request trigger compilation. The second uses the same seed and shape

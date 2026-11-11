@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single-device FLUX.2 Klein Diffusers adapter smoke test through Omni."""
+"""Single-device Diffusers adapter example through Omni, using FLUX.2 Klein."""
 
 import argparse
 import time
