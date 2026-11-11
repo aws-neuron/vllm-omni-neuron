@@ -71,6 +71,10 @@ class NeuronDiffusionModelRunner(DiffusionModelRunner):
         if load_format == "dummy":
             return
 
+        if load_format == "diffusers":
+            self._load_diffusers_adapter()
+            return
+
         load_config = LoadConfig()
         # The loader takes od_config in its constructor.
         loader = DiffusersPipelineLoader(load_config, self.od_config)
@@ -155,6 +159,37 @@ class NeuronDiffusionModelRunner(DiffusionModelRunner):
         # Patch predict_noise AFTER compile — the patch is Python-level and must
         # reference the final pipeline object (compile may return a new wrapper).
         self._patch_predict_noise_for_capture()
+
+    def _load_diffusers_adapter(self) -> None:
+        """Load the whole-pipeline adapter without native Wan compilation hooks."""
+        from vllm_omni.diffusion.config import set_current_diffusion_config
+
+        from vllm_omni_neuron.backend import uses_native_compilation_backend
+        from vllm_omni_neuron.diffusion.models.diffusers_adapter import (
+            NeuronDiffusersAdapterPipeline,
+        )
+
+        if self.device.type != "cpu" and not uses_native_compilation_backend():
+            raise ValueError(
+                "The Diffusers PoC requires VLLM_NEURON_BACKEND=neuron_native; "
+                "the legacy XLA compilation route is not supported."
+            )
+        with set_current_diffusion_config(self.od_config):
+            self.pipeline = NeuronDiffusersAdapterPipeline(
+                od_config=self.od_config, device=torch.device("cpu")
+            )
+            self.pipeline.load_weights()
+            self.pipeline.to(self.device)
+        self.cache_backend = None
+        if self.device.type != "cpu":
+            from vllm import envs as vllm_envs
+            from vllm_neuron.envs import get_compile_backend_name
+
+            options = {}
+            if vllm_envs.VLLM_CACHE_ROOT:
+                options["compiler_workdir"] = vllm_envs.VLLM_CACHE_ROOT
+            self.pipeline.compile(backend=get_compile_backend_name(), options=options)
+        logger.info("Neuron Diffusers adapter loaded on %s (single device).", self.device)
 
     def _alias_cache_dit_enabler(self) -> None:
         """Reuse Wan's Cache-DiT enabler for the Neuron subclass."""
