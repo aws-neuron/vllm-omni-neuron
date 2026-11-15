@@ -289,8 +289,9 @@ by default).
 
 ### Comparison with 2x H100
 
-Same request as the H100 GPU benchmark (`benchmarks/minimax_h3_image_h100` on the
-`minimax-h3-image-h100-gpu-benchmark` branch: official 313-token sample prompt, seed 42,
+Same request as the H100 GPU benchmark
+([`benchmarks/minimax_h3_image_h100`](https://github.com/qingzwang/vllm-omni-neuron/tree/minimax-h3-image-h100-gpu-benchmark/benchmarks/minimax_h3_image_h100):
+official 313-token sample prompt, seed 42,
 median of 5 warm runs). Neuron: `Omni.generate` wall time ("request") and the pipeline's own
 time ("pipeline", the counterpart of the GPU benchmark's server-side compute; the GPU client
 end-to-end additionally includes PNG + base64 + HTTP, 0.3-1.0 s).
