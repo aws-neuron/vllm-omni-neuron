@@ -213,8 +213,13 @@ misty meadow at sunrise, photorealistic, detailed fur"*, seed 42):
 
 | Cores | 1024x1024 | 2048x2048 | 4096x4096 |
 |---|---|---|---|
-| 8 | 28.2 dB | 27.8 dB | 30.1 dB |
-| 16 | 24.9 dB | 34.1 dB | 30.8 dB |
+| 8 | 23.6 dB | 30.5 dB | 30.0 dB |
+| 16 | 25.0 dB | 32.8 dB | 29.9 dB |
+
+Changes that reorder bf16 arithmetic move these numbers by a few dB in either direction,
+because the six-step trajectory amplifies last-bit differences (the first port measured
+28.2 / 27.8 / 30.1 dB on 8 cores and 24.9 / 34.1 / 30.8 dB on 16). The FGCC kernels and
+head-major attention are bit-identical to the compiler path.
 
 All outputs are visually indistinguishable from the reference (same composition and fine
 detail at full resolution).
