@@ -46,7 +46,9 @@ The pipeline reads `transformer_diffusers/`, `vae_diffusers/`, `text_encoder/`,
 | **Parallelism** | Tensor parallelism (TP=8, 7 heads per rank) | ✅ |
 | | Context parallelism over the packed sequence (`ring_degree`) | ✅ |
 | | Tile-parallel VAE decode over all ranks | ✅ |
-| **Acceleration** | Static step cache (`cache_steps: [3, 5]`) | ✅ (opt-in) |
+| **Acceleration** | Matmul + TP reduce-scatter NKI kernels with in-kernel collectives (FGCC) | ✅ (default) |
+| | Head-major attention for long sequences | ✅ (default) |
+| | Static step cache (`cache_steps: [3, 5]`) | ✅ (opt-in, lossy) |
 | **Compilation** | `torch.compile`, one block-group graph reused for all 50 blocks | ✅ |
 
 ### How the Neuron implementation differs from the reference
@@ -83,6 +85,25 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
   and down projections becomes a reduce-scatter, and an all-gather precedes QKV and the FFN
   (same bytes), so the norms, modulation, gates and residual adds run on 1/8 of the rows
   (-18% per block).
+- **RoPE without slicing.** The rotate-half of RoPE is written as `x * [cos, 1] + (x @ P) *
+  [sin, 0]` with `P` an exact +-1 permutation matrix, so no slice/concatenate copies are
+  emitted around the attention (bit-identical). The CP all-gather of K and V is one fused
+  collective instead of two. Together they removed a DMA-bound copy that dominated the edit
+  graphs (single-reference edit 4.0 s -> 2.95 s on 16 cores).
+- **Head-major attention for long sequences** (`HEAD_MAJOR_MIN_ROWS = 6144` rows per CP rank,
+  i.e. 4096x4096 and large edits). Q/K/V are projected straight into the attention kernel's
+  `[heads, S, D]` layout and the out-projection contracts over heads, so the layout transposes
+  around the kernel disappear (bit-identical, -3% per block at 4096x4096; off at 2048x2048
+  where the batched projections are slower).
+- **Collectives inside NKI kernels (FGCC).** On Trn2 every collective the compiler emits is a
+  blocking step for all engines. The out-projection and the FFN down projection therefore run
+  as NKI kernels that chunk the matmul and issue each chunk's TP reduce-scatter in-kernel, so
+  it overlaps the next chunk's matmuls (bit-identical; see
+  [Collective overlap](#collective-overlap-fgcc-kernels)).
+- **Device-resident sampling.** The latents stay on the device for all six steps: the Euler
+  update is fused into the last block-group graph of each step and the host only waits on
+  the step before the previous one (bounded in-flight launches, no host round trip per step).
+  Text buckets are finer (`text_buckets`), so short prompts pad less.
 - **Text encoder.** Only the 50 layers that feed `hidden_states[50]` are built (TP over
   the same TP group as the DiT); the token embedding lookup runs on the host.
 - **VAE decode.** The reference decodes in overlapping 256-pixel tiles of identical
@@ -90,7 +111,8 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
   decoder's output precision). Rank 0 copies them to the host once and stitches them by
   writing each tile's reference blend weights straight into one buffer (bit-identical to
   the reference's blend-and-concatenate stitch, 2x faster). The image is returned to the
-  engine as uint8.
+  engine as contiguous HWC uint8, so the engine's PIL conversion no longer does a strided
+  CHW -> HWC copy (-0.24 s at 4096x4096).
 
 ### Recommended configurations
 
@@ -124,14 +146,15 @@ All images below were produced by this implementation on one Trn2 chip (16 Neuro
 TP8 x CP2) with the default settings (BF16, no step cache). They are JPEG-compressed copies
 of the PNG outputs.
 
-**Text-to-image, 2048x2048** (1.56 s per request), seed 42:
+**Text-to-image, 2048x2048** (1.56 s per request), seed 42. The prompt is the checkpoint's
+313-token rewritten prompt (the one the H100 benchmark uses) for the instruction
 
 > A rustic, overhead shot of a farm-to-table feast, showcasing a variety of colorful,
 > seasonal vegetables, artisanal cheeses, and freshly baked bread on a weathered wooden table.
 
 ![T2I 2048x2048](images/minimax-h3-image/t2i_2048.jpg)
 
-**Text-to-image, 4096x4096** (6.88 s per request), same prompt and seed. Left: the whole image,
+**Text-to-image, 4096x4096** (7.09 s per request), same prompt and seed. Left: the whole image,
 downscaled to 1024x1024. Right: a 1024x1024 crop at native resolution.
 
 | Full image (downscaled) | Native-resolution crop |
@@ -143,7 +166,9 @@ reference that the accuracy tiers below use:
 
 ![Neuron vs CPU reference](images/minimax-h3-image/t2i_2048_neuron_vs_reference.jpg)
 
-**Single-reference edit** (2.89 s per request), seed 1234, 2048 canvas:
+**Single-reference edit** (2.89 s per request), seed 1234, 2048 canvas. The prompt is the
+checkpoint's rewritten `examples/prompt.edit.txt` (1459 presentation tokens) for the
+instruction (`examples/instruction.edit.txt`)
 
 > Take the over-ear headphones off the man on the left and fill in his hair where the band
 > flattened it. Have both hosts lean toward each other and fist-bump directly above the
@@ -152,7 +177,7 @@ reference that the accuracy tiers below use:
 
 ![Single-reference edit](images/minimax-h3-image/edit_single.jpg)
 
-**Three-reference edit** (9.13 s per request), seed 7, 2048 canvas:
+**Three-reference edit** (9.22 s per request), seed 7, 2048 canvas:
 
 > Place the main subject of <Picture 2> into the environment of <Picture 3>, standing in the
 > foreground on the left. Next to them, add the main subject of <Picture 1>. Keep the lighting
@@ -202,14 +227,23 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 
 | Cores | Resolution | Denoise (6 steps) | VAE decode | Request | PSNR vs reference |
 |---|---|---|---|---|---|
-| 8 | 1024x1024 | 0.66 s | 0.05 s | **0.74 s** | 23.6 dB |
-| 8 | 2048x2048 | 2.19 s | 0.20 s | **2.47 s** | 34.0 dB |
-| 8 | 4096x4096 | 12.1 s | 0.76 s | **13.0 s** | 30.1 dB |
-| 16 | 1024x1024 | 0.47 s | 0.03 s | **0.54 s** | 22.9 dB |
-| 16 | 2048x2048 | 1.35 s | 0.15 s | **1.59 s** | 30.2 dB |
-| 16 | 4096x4096 | 6.20 s | 0.50 s | **7.06 s** | 30.2 dB |
+| 8 | 1024x1024 | 0.68 s | 0.05 s | **0.75 s** | 23.6 dB |
+| 8 | 2048x2048 | 2.18 s | 0.21 s | **2.42 s** | 30.5 dB |
+| 8 | 4096x4096 | 12.3 s | 0.81 s | **13.3 s** | 30.0 dB |
+| 16 | 1024x1024 | 0.49 s | 0.03 s | **0.55 s** | 25.0 dB |
+| 16 | 2048x2048 | 1.31 s | 0.14 s | **1.49 s** | 32.8 dB |
+| 16 | 4096x4096 | 6.22 s | 0.49 s | **6.85 s** | 29.9 dB |
 
-Text encoding takes 8-20 ms in every configuration. Cold first requests compile for
+Text encoding takes 8-20 ms in every configuration. PSNR is against the diffusers CPU
+reference; 23-33 dB is bf16 rounding of a six-step trajectory (no visible difference, see
+[Examples](#examples)).
+
+**Sustained load.** Back-to-back generations at 4096x4096 slow down by ~0.05 s per request
+for the first ~8 requests and then level off ~5% slower (16 cores: 6.90 s for the first warm
+request, ~7.25 s after ten); after 60 s idle the first request is back at 6.95 s. The same
+code gives the same curve every session, so this is the device under sustained load (power /
+clock), not the pipeline. Averages of three runs (this table) and medians of five (the H100
+comparison below) therefore differ by up to 0.2 s at 4096x4096. Cold first requests compile for
 ~1-5 minutes (one compiled 5-block graph is reused for all 50 blocks).
 
 **Where the time goes** (device profile of one warm 2048x2048 request on 8 cores, rank 0):
@@ -240,6 +274,19 @@ replica groups.
 | + head-major attention | 4.50 ms | 20.48 ms |
 | + FGCC out-projection / FFN down (default) | 4.48 ms | **19.58 ms** |
 
+End to end on 16 cores (same session, back-to-back A/B, bit-identical images): 4096x4096
+request 7.07 -> 6.88 s, 2048x2048 1.58 -> 1.56 s; together with the HWC uint8 output
+(-0.24 s at 4096x4096) the 4096x4096 request in the H100 comparison went from 7.31 s to
+7.09 s. On 8 cores the end-to-end time is unchanged (13.89 -> 13.88 s pipeline at
+4096x4096).
+
+Tried and not kept (no gain, or slower): the all-gather + matmul kernel for Q/K/V and for the
+FFN up projection with a fused SwiGLU epilogue (the in-kernel all-gather competes with the
+matmuls for DMA bandwidth), an AdaLN epilogue fused into the reduce-scatter kernel, CP ring
+attention (attention over the local K/V block while the partner's block is gathered
+in-kernel, then an exact softmax merge), and constant-max attention (kept as an option, off
+by default).
+
 ### Comparison with 2x H100
 
 Same request as the H100 GPU benchmark (`benchmarks/minimax_h3_image_h100` on the
@@ -250,26 +297,28 @@ end-to-end additionally includes PNG + base64 + HTTP, 0.3-1.0 s).
 
 | Case | Neuron 8 cores (pipeline / request) | Neuron 16 cores (pipeline / request) | H100x2 vLLM-Omni TP2 (server) | H100x2 SGLang Ulysses2 (server) |
 |---|---|---|---|---|
-| 1024x1024, native 1024 canvas | 0.84 / 0.86 s | 0.56 / 0.58 s | 0.55 s | 0.34 s |
-| 1024x1024, default 2048 canvas | 2.63 / 2.66 s | 1.64 / 1.66 s | 1.37 s | 1.22 s |
-| 2048x2048 | 2.53 / 2.61 s | 1.54 / 1.62 s | 1.38 s | 1.07 s |
-| 4096x4096 | 13.89 / 14.18 s | 7.04 / 7.31 s | 6.12 s | 5.28 s |
+| 1024x1024, native 1024 canvas | 0.84 / 0.85 s | 0.60 / 0.61 s | 0.55 s | 0.34 s |
+| 1024x1024, default 2048 canvas | 2.62 / 2.63 s | 1.58 / 1.60 s | 1.37 s | 1.22 s |
+| 2048x2048 | 2.58 / 2.61 s | 1.53 / 1.56 s | 1.38 s | 1.07 s |
+| 4096x4096 | 13.88 / 13.99 s | 6.98 / 7.09 s | 6.12 s | 5.28 s |
 
 4096x4096 by stage:
 
 | Stage | Neuron 8 cores | Neuron 16 cores | H100x2 vLLM-Omni TP2 | H100x2 SGLang Ulysses2 |
 |---|---|---|---|---|
-| Text encoder | 12 ms | 12 ms | 68 ms | 77 ms |
-| DiT, 6 steps | 13.10 s (2.18 s/step) | 6.52 s (1.09 s/step) | 5.30 s (0.88 s/step) | 4.95 s (0.83 s/step) |
-| VAE decode (+8-bit, to host) | 0.82 s | 0.50 s | 0.59 s | 0.28 s |
+| Text encoder | 11 ms | 13 ms | 68 ms | 77 ms |
+| DiT, 6 steps | 13.05 s (2.17 s/step) | 6.50 s (1.08 s/step) | 5.30 s (0.88 s/step) | 4.95 s (0.83 s/step) |
+| VAE decode (+8-bit, to host) | 0.82 s | 0.47 s | 0.59 s | 0.28 s |
 | DiT MFU (BF16 dense peak) | 36% of 1.33 PFLOPS | 36% of 2.67 PFLOPS | ~60% of 1.98 PFLOPS | ~63% of 1.98 PFLOPS |
 
 16 Neuron cores (4 Trainium2 chips) have ~1.35x the BF16 peak of two H100s but split the DiT
-16 ways (TP8 x CP2) instead of 2. The gap is the DiT's efficiency: every collective
-compiles to a blocking step (all engines wait on it), so the 16-way communication is fully
-exposed (~25% of a block at 4096x4096; with collectives replaced by no-ops a block takes
-15.4 instead of 20.6 ms, which would put the 6 steps at ~4.9 s), and the projection matmuls
-reach ~57% of peak while the tensor engine is busy.
+16 ways (TP8 x CP2) instead of 2. The gap is the DiT's efficiency: every collective the
+compiler emits is a blocking step (all engines wait on it), so most of the 16-way
+communication is exposed. With all collectives replaced by no-ops a 4096x4096 block takes
+15.4 ms; the FGCC kernels hide part of it (20.5 -> 19.6 ms), the remaining ~4 ms per block
+(~20%) is mostly the all-gathers before Q/K/V and the FFN and the CP K/V all-gather, which did not get faster
+as in-kernel collectives. The projection matmuls reach ~57% of peak while the tensor engine
+is busy.
 
 ### Single-instance throughput
 
@@ -308,18 +357,23 @@ repeated for `<Picture 2>`, ...) follow the reference `image_conditioned` pipeli
 Example from the checkpoint (`examples/reference1.png`, `examples/prompt.edit.txt`, seed 1234,
 2048x2048 canvas, 1459 presentation tokens):
 
-| Cores | Request | Host + vision + VAE encode | Denoise (6 steps) | VAE decode | PSNR vs reference |
+| Cores | Request | Host + vision + VAE encode + text encoder | Denoise (6 steps) | VAE decode | PSNR vs reference |
 |---|---|---|---|---|---|
-| 8 | **5.09 s** | 0.73 s | 4.02 s | 0.20 s | 36.6 dB |
-| 16 | **4.33 s** | 0.68 s | 3.33 s | 0.15 s | 34.3 dB |
+| 8 | **4.56 s** | 0.63 s | 3.69 s | 0.20 s | 33.5 dB |
+| 16 | **2.89 s** | 0.54 s | 2.16 s | 0.14 s | 36.0 dB |
 
 Three references with different aspect ratios (1536x1024, 1024x1536, 3000x1687 VAE copies;
 4977 presentation tokens, 20480 packed rows on Neuron), seed 7, 2048x2048 canvas:
 
-| Cores | Request | Host + vision + VAE encode | Denoise (6 steps) | VAE decode |
+| Cores | Request | Host + vision + VAE encode + text encoder | Denoise (6 steps) | VAE decode |
 |---|---|---|---|---|
-| 8 | **21.6 s** | 4.4 s | 16.8 s | 0.20 s |
-| 16 | **12.6 s** | 3.5 s | 8.6 s | 0.15 s |
+| 8 | **17.0 s** | 3.3 s | 13.5 s | 0.21 s |
+| 16 | **9.2 s** | 2.0 s | 7.0 s | 0.14 s |
+
+The edit latency fell from 4.33 s / 12.6 s (16 cores) mostly through the slicing-free RoPE
+and fused K/V gather (the edit graphs were DMA-bound on those copies), the per-reference
+vision tower on its own rank with one device all-reduce to assemble the presentation, and
+host threads for the preparation.
 
 Teacher-forced target velocity against the CPU reference stays at rel 1.2-4.5e-2 (cosine
 >= 0.9990) at every step. The free-running images show the same edit (same subjects, scene and
