@@ -47,3 +47,23 @@ WAN2_2_I2V_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Topology for MiniMax-H3-Image (text-to-image). vllm-omni 0.29 ships no pipeline whose
+# ``diffusers_class_name`` matches the checkpoint's ``MiniMaxH3ImagePipeline``.
+MINIMAX_H3_IMAGE_PIPELINE = PipelineConfig(
+    model_type="minimax_h3_image",
+    model_arch="MiniMaxH3ImagePipeline",
+    diffusers_class_name="MiniMaxH3ImagePipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="image",
+            model_arch="MiniMaxH3ImagePipeline",
+        ),
+    ),
+)

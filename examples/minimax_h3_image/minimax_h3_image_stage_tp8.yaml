@@ -1,0 +1,14 @@
+# MiniMax-H3-Image on 0-7 of a trn2.48xlarge (LNC=2). DiT: TP=8 (7 heads per rank) x CP=1.
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    runtime:
+      devices: "0-7"
+    engine_args:
+      model_class_name: MiniMaxH3ImagePipeline
+      dtype: bfloat16
+      model_config:
+        text_buckets: [256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 1

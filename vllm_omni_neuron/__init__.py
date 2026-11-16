@@ -56,9 +56,13 @@ def register_pipeline_topologies() -> None:
     try:
         from vllm_omni.config.pipeline_registry import register_pipeline
 
-        from vllm_omni_neuron.diffusion.pipeline_topologies import WAN2_2_I2V_PIPELINE
+        from vllm_omni_neuron.diffusion.pipeline_topologies import (
+            MINIMAX_H3_IMAGE_PIPELINE,
+            WAN2_2_I2V_PIPELINE,
+        )
 
         register_pipeline(WAN2_2_I2V_PIPELINE)
+        register_pipeline(MINIMAX_H3_IMAGE_PIPELINE)
         _topologies_registered = True
     finally:
         _topologies_registering = False

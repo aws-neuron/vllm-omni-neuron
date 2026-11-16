@@ -15,6 +15,7 @@ validation and performance benchmarking.
 |---|---|---|---|---|---|---|
 | Wan2.2 | T2V-A14B | Text to video | Trn2, Trn3 | ✅ | ✅ | In progress |
 | Wan2.2 | I2V-A14B | Image to video | Trn2, Trn3 | ✅ | ✅ | In progress |
+| MiniMax-H3 | MiniMax-H3-Image | Text to image | Trn2 | ✅ | ✅ | In progress |
 
 - **Correctness** — Accuracy validation passing (VBench and reference comparison)
 - **Perf Test** — Performance benchmark tests tracked across releases

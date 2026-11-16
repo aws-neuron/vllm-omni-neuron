@@ -1,0 +1,18 @@
+# MiniMax-H3-Image text-to-image on trn2.48xlarge (64 logical cores at LNC=2).
+# DiT: TP=8 (56 heads -> 7 per rank) x CP=8 over the packed [image | text] sequence.
+# The text encoder runs TP=8 inside every CP replica; VAE decode spreads its tiles
+# over all 64 ranks.
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    runtime:
+      devices: "0-63"
+    engine_args:
+      model_class_name: MiniMaxH3ImagePipeline
+      dtype: bfloat16
+      model_config:
+        # Padded text lengths (one compiled DiT graph per bucket and canvas).
+        text_buckets: [256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 8

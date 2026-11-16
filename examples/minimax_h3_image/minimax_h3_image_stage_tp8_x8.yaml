@@ -1,0 +1,18 @@
+# MiniMax-H3-Image throughput layout for a full trn2.48xlarge (64 logical cores, LNC=2):
+# eight independent TP=8 replicas on cores 0-7, 8-15, ..., 56-63. Requests are
+# load-balanced across replicas, so per-image latency is that of the 8-core layout and
+# throughput is ~8x. ``devices`` is the per-replica template (offsets within a replica).
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    runtime:
+      devices: "0,1,2,3,4,5,6,7"
+      num_replicas: 8
+    engine_args:
+      model_class_name: MiniMaxH3ImagePipeline
+      dtype: bfloat16
+      model_config:
+        text_buckets: [256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      parallel_config:
+        tensor_parallel_size: 8
+        ring_degree: 1

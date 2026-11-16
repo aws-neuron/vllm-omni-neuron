@@ -98,3 +98,8 @@ class Wan22EnvProfile:
 
 WAN22_T2V = Wan22EnvProfile()
 WAN22_I2V = Wan22EnvProfile()
+# One MiniMax-H3-Image step enqueues ~12 graph launches (embed, 10 block groups, head) before
+# the host syncs; raise the runtime's per-core execution queue above that.
+MINIMAX_H3_IMAGE = Wan22EnvProfile(
+    extra=EnvWrites(setdefault={"NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS": "63"})
+)

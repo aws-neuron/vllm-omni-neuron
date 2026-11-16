@@ -19,6 +19,13 @@ Text-to-video recipe for WAN 2.2 A14B on Trainium.
 Image-to-video recipe for WAN 2.2 A14B on Trainium.
 :::
 
+:::{grid-item-card} MiniMax-H3-Image
+:link: minimax-h3-image
+:link-type: doc
+
+Text-to-image recipe for MiniMax-H3-Image (up to 4096x4096) on Trainium.
+:::
+
 ::::
 
 :::{toctree}
@@ -27,4 +34,5 @@ Image-to-video recipe for WAN 2.2 A14B on Trainium.
 
 WAN 2.2 T2V <wan22-t2v-14b>
 WAN 2.2 I2V <wan22-i2v-14b>
+MiniMax-H3-Image <minimax-h3-image>
 :::
