@@ -29,6 +29,13 @@ parser.add_argument("--prompt", default="A highland cow standing in a misty mead
 parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file (overrides --prompt)")
 parser.add_argument("--image", action="append", default=None,
                     help="Reference image for editing; repeat for <Picture 2>, <Picture 3>, ...")
+parser.add_argument("--mask", default=None,
+                    help="Inpainting mask for <Picture 1> (white = regenerate, black = keep)")
+parser.add_argument("--outpaint", default=None,
+                    help="Outpainting: extend <Picture 1> by LEFT,TOP,RIGHT,BOTTOM pixels (sets the output size)")
+parser.add_argument("--mask-mode", choices=["blend", "paste"], default="blend",
+                    help="blend: keep the unmasked latents at every step and paste back; paste: paste back only")
+parser.add_argument("--mask-feather", type=int, default=32, help="Feather of the pixel composite, in pixels")
 parser.add_argument("--height", type=int, default=2048)
 parser.add_argument("--width", type=int, default=2048)
 parser.add_argument("--min-generation-area", type=int, default=2048 * 2048)
@@ -88,6 +95,28 @@ def main():
         from PIL import Image
 
         request["multi_modal_data"] = {"image": [Image.open(p) for p in args.image]}
+    if args.mask or args.outpaint:
+        from PIL import Image, ImageFilter
+
+        if not args.image:
+            raise SystemExit("--mask / --outpaint need --image (the image to inpaint or extend)")
+        src = Image.open(args.image[0]).convert("RGB")
+        if args.outpaint:
+            left, top, right, bottom = (int(v) for v in args.outpaint.split(","))
+            w, h = src.width + left + right, src.height + top + bottom
+            w32, h32 = -(-w // 32) * 32, -(-h // 32) * 32  # canvas sizes are multiples of 32
+            right, bottom = right + w32 - w, bottom + h32 - h
+            # init canvas: the image stretched over the new area (only seen inside the mask)
+            init = src.resize((w32, h32), Image.BILINEAR).filter(ImageFilter.GaussianBlur(32))
+            init.paste(src, (left, top))
+            mask = Image.new("L", (w32, h32), 255)
+            mask.paste(0, (left, top, left + src.width, top + src.height))
+            params.height, params.width = h32, w32
+            params.extra_args["init_image"] = init
+            print(f"[outpaint] {src.size} -> {(w32, h32)} (left {left}, top {top}, right {right}, bottom {bottom})")
+        else:
+            mask = Image.open(args.mask)
+        params.extra_args.update(mask=mask, mask_mode=args.mask_mode, mask_feather=args.mask_feather)
     t0 = time.perf_counter()
     result = omni.generate(request, params)
     print(f"first generation (includes compilation on a cold cache): {time.perf_counter() - t0:.2f}s")

@@ -39,6 +39,7 @@ The pipeline reads `transformer_diffusers/`, `vae_diffusers/`, `text_encoder/`,
 |---|---|---|
 | **Generation** | Text-to-image | ✅ |
 | | Image editing (up to 16 reference images) | ✅ |
+| | Mask-guided inpainting / outpainting | Experimental |
 | | 1024x1024 to 4096x4096 (`min_generation_area` canvas policy, LANCZOS resize back) | ✅ |
 | | Six-step PDD sampling, no CFG | ✅ |
 | **Precision** | BF16 DiT and text encoder, BF16 VAE decoder (FP32 norms) | ✅ |
@@ -390,6 +391,52 @@ case.
 Accuracy per component against the CPU reference: text-row embeddings mean cosine 0.9996
 (vision rows 0.993, the same spread the CPU reference shows against itself across thread
 counts), reference VAE encode rel 3e-7, teacher-forced target velocity rel 1.1-2.2e-2.
+
+## Inpainting and outpainting (experimental)
+
+The checkpoint is trained for text-to-image and instruction editing only (`tasks: [t2i, edit]`,
+no mask input). Mask-guided editing is added on top of the edit pipeline. Without a mask an
+instruction edit regenerates the whole image: in the examples below 39-42% of the pixels
+outside the edited object change and small text is garbled. With a mask the pixels outside
+it are kept (mean difference 0.00-0.01 out of 255).
+
+- `extra_args["mask"]`: white = regenerate, black = keep (any size, resized to the canvas).
+  The image to keep is `<Picture 1>` (or `extra_args["init_image"]`), which also conditions
+  the edit as usual.
+- `mask_mode="paste"`: generate, then composite the original pixels back outside the mask
+  (feathered by `mask_feather`, default 32 px).
+- `mask_mode="blend"` (default): in addition, after every step the latents outside the mask
+  (dilated by `mask_dilate` latent patches, default 1) are replaced with the original's
+  latents noised to that step's level with the request's initial noise; this keeps the
+  generated region consistent with what will be pasted back.
+- `run.py --mask mask.png` or `run.py --outpaint LEFT,TOP,RIGHT,BOTTOM` (places `<Picture 1>`
+  on the larger canvas, masks the new area and sets the output size).
+
+16 cores, 2048x2048, `reference1.png`, seed 1234. Request time: edit without a mask 2.88 s,
+`paste` 3.34 s, `blend` 4.14 s (one VAE encode of the original and a host blend per step).
+
+*"Remove the over-ear headphones from the man on the left and fill in his short, tousled dark
+brown hair naturally where the headband was. Keep his face, expression and the rest of
+<Picture 1> unchanged."*
+
+![Inpainting the headphones](images/minimax-h3-image/inpaint_head.jpg)
+
+*"Replace the black "INVEST IN YOURSELF" mug on the left of the desk in <Picture 1> with a tall
+glass of fresh orange juice, lit by the same warm lamp light. Keep everything else unchanged."*
+Without a mask the model replaces both mugs.
+
+![Inpainting the mug](images/minimax-h3-image/inpaint_mug.jpg)
+
+Outpainting the 2048x2048 text-to-image example by 1024 px on each side (seed 7): *"Extend
+<Picture 1> to a wide panorama: continue the same weathered dark wooden table to the left and
+right with more seasonal vegetables, artisanal cheeses and freshly baked bread, same overhead
+camera angle, same lighting and colours, photorealistic."*
+
+![Outpainting](images/minimax-h3-image/outpaint.jpg)
+
+Limitations: everything inside the mask is regenerated (a mask over a face changes the
+person); `paste` and `blend` looked alike on these examples; a faint seam can remain at the
+feathered edge; only these three cases were evaluated.
 
 ## Step cache
 

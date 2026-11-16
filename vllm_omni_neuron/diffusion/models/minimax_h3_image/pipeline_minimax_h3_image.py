@@ -600,6 +600,64 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             moments.append(stitch_tiles_direct(t, ny, nx, yo, xo))  # == the reference blend, bit for bit
         return moments
 
+    def _mask_inputs(self, extra, images, height, width, lh, lw) -> dict:
+        """Mask-guided editing (inpainting / outpainting), not a mode the model was trained for.
+
+        ``extra["mask"]``: white = regenerate (any size, resized to the canvas).
+        ``extra["init_image"]``: the image to keep outside the mask (default ``<Picture 1>``),
+        resized to the canvas. ``mask_mode``: ``"paste"`` composites the init pixels back after
+        decoding; ``"blend"`` (default) also replaces the latents outside the mask after every
+        step with the init latents noised to that step's level. ``mask_dilate`` (latent patches,
+        default 1) grows the regenerated latent region; ``mask_feather`` (pixels, default 32)
+        softens the pixel composite.
+        """
+        import numpy as np
+        from PIL import Image, ImageFilter, ImageOps
+
+        def pil(x):
+            if isinstance(x, str):
+                x = Image.open(x)
+            if isinstance(x, np.ndarray):
+                x = Image.fromarray(x)
+            return ImageOps.exif_transpose(x)
+
+        mode = extra.get("mask_mode", "blend")
+        if mode not in ("blend", "paste"):
+            raise ValueError(f"mask_mode must be 'blend' or 'paste', got {mode!r}")
+        init = pil(extra.get("init_image") or images[0]).convert("RGB").resize((width, height), Image.LANCZOS)
+        mask = pil(extra["mask"]).convert("L").resize((width, height), Image.BILINEAR)
+        feather = int(extra.get("mask_feather", 32))
+        ctx = dict(blend=mode == "blend", init=None, w=None)
+        if self.is_output_rank:  # pixel composite weights: grow by the feather radius, then blur
+            mt = torch.from_numpy((np.asarray(mask) >= 128).astype(np.float32))[None, None]
+            r = feather // 2
+            if r > 0:  # separable max-pool dilation (PIL's MaxFilter is O(k^2) per pixel)
+                mt = torch.nn.functional.max_pool2d(mt, (2 * r + 1, 1), stride=1, padding=(r, 0))
+                mt = torch.nn.functional.max_pool2d(mt, (1, 2 * r + 1), stride=1, padding=(0, r))
+            mb = Image.fromarray((mt[0, 0].numpy() * 255).astype(np.uint8))
+            if feather > 0:
+                mb = mb.filter(ImageFilter.GaussianBlur(feather / 2))
+            ctx["w"] = torch.from_numpy(np.asarray(mb, dtype=np.float32) / 255.0)[..., None]
+            ctx["init"] = torch.from_numpy(np.array(init))
+        if not ctx["blend"]:
+            return ctx
+        # latent-patch mask (32 px cells): any masked pixel regenerates the cell, then dilate
+        mp = torch.from_numpy(np.asarray(mask, dtype=np.float32) / 255.0)[None, None]
+        cell = torch.nn.functional.adaptive_max_pool2d(mp, (lh // 2, lw // 2))
+        k = int(extra.get("mask_dilate", 1))
+        if k > 0:
+            cell = torch.nn.functional.max_pool2d(cell, 2 * k + 1, stride=1, padding=k)
+        m = (cell > 0.5).float().reshape(-1, 1)
+        moments = self._encode_references([init])
+        z0 = torch.empty((lh // 2) * (lw // 2), self.transformer.config.patch_dim, dtype=torch.float32)
+        if self.rank == 0:
+            mean = torch.chunk(moments[0], 2, dim=1)[0][..., :lh, :lw].to(torch.float16).float()
+            z0 = patchify((mean - self._vae_latents_mean) / self._vae_latents_std)
+        if self.world > 1:
+            dist.broadcast(z0, src=0)
+        ctx.update(z0=z0, m=m)
+        return ctx
+
     @staticmethod
     def _prompt_of(raw) -> str:
         if isinstance(raw, str):
@@ -646,6 +704,13 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
             num_text = len(token_ids)
             text_pad = choose_text_pad(num_text, n_img, self.cp_size, self.text_buckets)
+        self._mask_ctx = None
+        if extra.get("mask") is not None:
+            if not images:
+                raise ValueError("a mask needs a reference image (<Picture 1> is the image to inpaint)")
+            t1 = time.perf_counter()
+            self._mask_ctx = self._mask_inputs(extra, images, height, width, lh, lw)
+            timings["mask_s"] = time.perf_counter() - t1
 
         # 1. text encoder
         if edit is None:
@@ -709,6 +774,16 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             # a step is ~12): wait for the previous step while this one runs on the device.
             if prev is not None:
                 prev.cpu()
+            mc = self._mask_ctx
+            if mc is not None and mc["blend"]:
+                # Known region: the init latents noised to the next step's level with the
+                # initial noise (sigma = 0 after the last step, i.e. the init latents).
+                host = rows_next.cpu()
+                sig = float(self.sigmas[i + 1])
+                known = (1.0 - sig) * mc["z0"] + sig * latents
+                m = mc["m"]
+                host[0, :n_img] = m * host[0, :n_img] + (1.0 - m) * known.to(host.dtype)
+                rows_next = host.to(dev)
             prev, rows = rows, rows_next
         latents = rows.cpu()[0, :n_img]  # the generated rows come first in both layouts
         timings["denoise_s"] = time.perf_counter() - t0
@@ -739,6 +814,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         # released pipeline then resizes the 8-bit image. Returned as contiguous [1, H, W, 3]
         # (rank 0 has the threads for the layout change; the engine's PIL conversion does not).
         image = image.permute(0, 2, 3, 1).contiguous()
+        mc = getattr(self, "_mask_ctx", None)
+        if mc is not None:  # keep the init image's pixels outside the (feathered) mask
+            w = mc["w"]
+            image = (image[0].float() * w + mc["init"].float() * (1.0 - w)).round().clamp(0, 255).to(torch.uint8)[None]
         if (out_h, out_w) != tuple(image.shape[1:3]):
             from PIL import Image
 
