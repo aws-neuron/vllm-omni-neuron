@@ -409,8 +409,13 @@ it are kept (mean difference 0.00-0.01 out of 255).
   (dilated by `mask_dilate` latent patches, default 1) are replaced with the original's
   latents noised to that step's level with the request's initial noise; this keeps the
   generated region consistent with what will be pasted back.
+- `mask_mode="clean"`: the kept latents are held as clean context rows inside the target (the
+  modulation table of reference images, at their own canvas positions) and only the masked rows
+  are generated. It also works without any reference image (`extra_args["init_image"]` plus a
+  text-to-image prompt), which is the best variant for outpainting (see below).
 - `run.py --mask mask.png` or `run.py --outpaint LEFT,TOP,RIGHT,BOTTOM` (places `<Picture 1>`
-  on the larger canvas, masks the new area and sets the output size).
+  on the larger canvas, masks the new area and sets the output size); `--mask-mode clean
+  --init-image photo.png` without `--image` for the reference-free variant.
 
 16 cores, 2048x2048, `reference1.png`, seed 1234. Request time: edit without a mask 2.88 s,
 `paste` 3.34 s, `blend` 4.14 s (one VAE encode of the original and a host blend per step).
@@ -436,7 +441,83 @@ camera angle, same lighting and colours, photorealistic."*
 
 Limitations: everything inside the mask is regenerated (a mask over a face changes the
 person); `paste` and `blend` looked alike on these examples; a faint seam can remain at the
-feathered edge; only these three cases were evaluated.
+feathered edge.
+
+### Outpainting study: texture-rich photos on a 2048x2048 canvas
+
+Nine photos from Wikimedia Commons (asphalt, cobblestones, a dry stone wall, a lawn, dry grass,
+gravel, a rock face, a dry riverbed, a country lane), each kept at its native pixel scale in five
+regions of a 2048x2048 canvas (`center` 1024x1024, `left` and `top` halves, `corner` 1408x1408,
+`strip` 768x2048) and the rest outpainted (seed 42, 16 cores, feather 16 px). 90 generations for
+the two methods below plus 6 ablations on the three hardest textures. Metrics, generated region
+against the kept region, both at least 64 px from the boundary: band-pass (Laplacian) detail at
+1x / 2x / 4x scale (1.0 = same texture energy, < 1 = smoother), Lab colour difference, and the
+gradient across the boundary over that beside it (1.0 = no edge).
+
+**A reference image hurts.** Reference and target coordinates are both normalized to the frame,
+so the edit model treats `<Picture 1>` as the whole picture: given the kept crop it re-renders
+the crop across the canvas at 2-3x scale (with the crop's stains and the photographer's shoe
+repeated); given the whole canvas with the unknown area filled, it copies the fill (grey stays
+grey, a mirrored fill becomes a kaleidoscope). Anchoring the reference's positions to its box
+changed the output but not this behaviour. Without a reference (text-to-image prompt describing
+the scene) and the kept region as clean context (`mask_mode="clean"`) the scene continues: the
+horizon, cobble arcs and wall courses carry on at the right place.
+
+![Reference-based variants copy or zoom the reference](images/minimax-h3-image/outpaint_reference_failures.jpg)
+
+*Left to right: `<Picture 1>` = the kept crop (asphalt, kept region downscaled 2.8x: the whole
+crop is redrawn larger, stains and shoe included); `<Picture 1>` = the canvas with a grey fill
+(copied); with a mirrored fill (copied); no reference, `clean` (riverbed, red box = kept).*
+
+**Results with `clean` and no reference**, median over the five layouts:
+
+| Photo | Detail 1x / 2x / 4x | Colour dE | Boundary | Seen at 1:1 |
+|---|---|---|---|---|
+| asphalt | 0.57 / 0.74 / 0.87 | 4.3 | 0.81 | generated aggregate ~2x coarser, lighter: clear boundary |
+| gravel | 0.62 / 0.75 / 0.78 | 1.6 | 0.91 | stones ~1.5-2x larger and softer: clear boundary |
+| lawn | 0.46 / 0.69 / 1.02 | 6.2 | 0.87 | long coarse blades instead of fine short ones, brighter: clear boundary |
+| dry grass | 1.06 / 1.15 / 1.24 | 4.9 | 0.92 | plausible, strand direction changes at the edge |
+| cobblestones | 0.60 / 0.75 / 0.90 | 3.7 | 0.77 | arcs continue; cobbles somewhat larger |
+| stone wall | 0.70 / 0.86 / 1.03 | 3.4 | 0.84 | courses continue; `top` adds a second wall below |
+| rock face | 0.80 / 1.07 / 1.12 | 3.0 | 1.05 | plausible, cracks do not continue across the edge |
+| riverbed | 0.80 / 0.96 / 1.09 | 4.2 | 1.09 | horizon and stones continue; stones larger near the edge |
+| country lane | 0.90 / 0.85 / 0.93 | 4.4 | 1.05 | plausible scene; `top` repeats the lane and wall below |
+
+The first method (`<Picture 1>` = kept crop, `blend`) gives similar medians on these native-scale
+crops (detail 0.67 / 0.87 / 1.00, dE 3.0 against 0.71 / 0.85 / 0.98, dE 4.2) but redraws scenes
+zoomed in (the country lane's wall and verge come out larger).
+
+![Outpainting with clean, no reference](images/minimax-h3-image/outpaint_textures.jpg)
+
+*Red box: kept region (photos at native scale). Rows: asphalt, gravel, lawn, dry grass, rock,
+riverbed; columns: center, left, top, corner, strip.*
+
+At full resolution the boundary stays visible in every case. With fine, regular textures
+(asphalt, gravel, lawn) the model fills in at its own grain size, about 1.5-2x coarser than the
+photo. Stating the scale in the prompt (*"extreme close-up from 30 cm, stone chips 2-5 mm"*)
+narrows it when the kept region is at one side (lawn detail 0.48 -> 0.73, gravel 0.83 -> 0.95 in
+the `left` layout) but not around a centred region. A second pass (re-noise to step 3 or 4 and
+denoise again with the kept region held) changed nothing measurable and was dropped. Coarse,
+irregular textures and scenes hide the edge better but it can still be found at 1:1.
+
+![Fine textures at 1:1 across the boundary](images/minimax-h3-image/outpaint_seams_fine.jpg)
+
+*1:1 crops centred on the boundary of the `left` layout (kept region on the left half).*
+
+![Coarse textures at 1:1 across the boundary](images/minimax-h3-image/outpaint_seams_good.jpg)
+
+*Same for dry grass, the rock face and the riverbed.*
+
+Request time (warm, 16 cores, 2048x2048): 2.7-2.9 s with `clean` and no reference, 4.1-4.2 s
+with a reference image.
+
+Photo credits (Wikimedia Commons; results from the CC BY-SA photos are reported in the table
+only): *Asphalt road texture* and *Green grass texture above* by Kurt Kaiser (CC0); *Last year's
+tufts of grass - overcast day* by W.carter (CC0); *Gray Gravel Rock Texture* by Photos Public
+Domain (CC0); *Rock texture Kymi Euboea Greece* by Jebulon (CC0); *Anawangin River's Dried And
+Rocky Riverbed* by Andrew Martin (CC BY 3.0); *Cobblestone pavement of the Alexandru D. Xenopol
+Street* by Neoclassicism Enthusiast, *Dry Stone Wall at Batworthy* by Partonez, *Bow Hill at
+Upper Hardres Kent England* by Acabashi (CC BY-SA 4.0).
 
 ## Step cache
 

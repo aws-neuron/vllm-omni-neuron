@@ -607,7 +607,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         ``extra["init_image"]``: the image to keep outside the mask (default ``<Picture 1>``),
         resized to the canvas. ``mask_mode``: ``"paste"`` composites the init pixels back after
         decoding; ``"blend"`` (default) also replaces the latents outside the mask after every
-        step with the init latents noised to that step's level. ``mask_dilate`` (latent patches,
+        step with the init latents noised to that step's level; ``"clean"`` instead holds the kept
+        latents as clean context rows (the reference modulation table, as for reference images)
+        at their own positions in the target, and also works without a reference image (text-to-image
+        prompt + ``init_image``): the best variant for outpainting. ``mask_dilate`` (latent patches,
         default 1) grows the regenerated latent region; ``mask_feather`` (pixels, default 32)
         softens the pixel composite.
         """
@@ -622,12 +625,13 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             return ImageOps.exif_transpose(x)
 
         mode = extra.get("mask_mode", "blend")
-        if mode not in ("blend", "paste"):
-            raise ValueError(f"mask_mode must be 'blend' or 'paste', got {mode!r}")
-        init = pil(extra.get("init_image") or images[0]).convert("RGB").resize((width, height), Image.LANCZOS)
+        if mode not in ("blend", "paste", "clean"):
+            raise ValueError(f"mask_mode must be 'blend', 'paste' or 'clean', got {mode!r}")
+        src = extra.get("init_image")
+        init = pil(src if src is not None else images[0]).convert("RGB").resize((width, height), Image.LANCZOS)
         mask = pil(extra["mask"]).convert("L").resize((width, height), Image.BILINEAR)
         feather = int(extra.get("mask_feather", 32))
-        ctx = dict(blend=mode == "blend", init=None, w=None)
+        ctx = dict(blend=mode in ("blend", "clean"), clean=mode == "clean", init=None, w=None)
         if self.is_output_rank:  # pixel composite weights: grow by the feather radius, then blur
             mt = torch.from_numpy((np.asarray(mask) >= 128).astype(np.float32))[None, None]
             r = feather // 2
@@ -706,8 +710,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             text_pad = choose_text_pad(num_text, n_img, self.cp_size, self.text_buckets)
         self._mask_ctx = None
         if extra.get("mask") is not None:
-            if not images:
-                raise ValueError("a mask needs a reference image (<Picture 1> is the image to inpaint)")
+            if not images and extra.get("init_image") is None:
+                raise ValueError("a mask needs init_image or a reference image (<Picture 1> is the image to inpaint)")
             t1 = time.perf_counter()
             self._mask_ctx = self._mask_inputs(extra, images, height, width, lh, lw)
             timings["mask_s"] = time.perf_counter() - t1
@@ -752,6 +756,20 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             tabs = rows_of_rank.view(1, -1, 1).to(dev)
             perm = layout.perm.to(dev)
 
+        mc = self._mask_ctx
+        if mc is not None and mc["clean"]:
+            # Kept target rows are clean context (reference table, real latents held every step);
+            # the masked rows are generated. Physical order puts the target rows first.
+            full = layout.tabs.clone() if edit is not None else torch.full((layout.total,), TAB_TEXT, dtype=torch.int32)
+            if edit is None:
+                full[:n_img] = TAB_TARGET
+            full[:n_img][mc["m"][:, 0] == 0] = TAB_REFERENCE
+            rows_of_rank = full[lo : lo + local]
+            if self.transformer.sequence_parallel:
+                n_sh = local // self.tp_size
+                rows_of_rank = rows_of_rank[self.tp_rank * n_sh : (self.tp_rank + 1) * n_sh]
+            tabs = rows_of_rank.view(1, -1, 1).to(dev)
+
         latents_in = getattr(sp, "latents", None)
         if edit is not None:
             noise = edit["noise"]
@@ -760,6 +778,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         else:
             noise = torch.randn((1, cfg.in_channels, 1, lh, lw), generator=self._generator(sp), dtype=torch.float32)
         latents = patchify(noise[:, :, 0])
+        noise_rows = latents
+        if mc is not None and mc["clean"]:
+            mc["held"] = REFERENCE_NOISE_AUG * mc["z0"] + (1.0 - REFERENCE_NOISE_AUG) * latents
+            latents = mc["m"] * latents + (1.0 - mc["m"]) * mc["held"]
         self.transformer.reset_step_cache()
         # Latents stay on the device: each step's final graph applies the Euler update.
         rows = (latents if ref_rows is None else torch.cat([latents, ref_rows]))[None].to(dev)
@@ -774,13 +796,15 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             # a step is ~12): wait for the previous step while this one runs on the device.
             if prev is not None:
                 prev.cpu()
-            mc = self._mask_ctx
             if mc is not None and mc["blend"]:
                 # Known region: the init latents noised to the next step's level with the
                 # initial noise (sigma = 0 after the last step, i.e. the init latents).
                 host = rows_next.cpu()
                 sig = float(self.sigmas[i + 1])
-                known = (1.0 - sig) * mc["z0"] + sig * latents
+                if mc["clean"]:  # held clean context; the exact latents after the last step
+                    known = mc["z0"] if i == len(self.timesteps) - 1 else mc["held"]
+                else:
+                    known = (1.0 - sig) * mc["z0"] + sig * noise_rows
                 m = mc["m"]
                 host[0, :n_img] = m * host[0, :n_img] + (1.0 - m) * known.to(host.dtype)
                 rows_next = host.to(dev)
